@@ -1,0 +1,222 @@
+/* eslint-disable react-refresh/only-export-components */
+import { createContext, useContext, useEffect, useMemo, useRef, useState, } from "react";
+import { useAuth } from "../auth/AuthContext";
+import { initialComplaintCases, initialNotificationCampaigns, initialStudentNotifications, } from "../services/communicationsData";
+import { apiRequest, backendConfig } from "../services/apiClient";
+import { defaultStudentRoute, indusRoutes } from "../services/indusRoutes";
+import { formatShortDateTime, relativeTimeLabel } from "../utils/dateLabels";
+const CommunicationsContext = createContext(null);
+const wait = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+const totalStudentCount = indusRoutes.reduce((sum, route) => sum + route.studentCount, 0);
+const findRoute = (routeCode) => indusRoutes.find((route) => route.code === routeCode);
+const findRouteFromService = (service) => indusRoutes.find((route) => service.includes(route.code));
+export function CommunicationsProvider({ children }) {
+    const { user } = useAuth();
+    const userId = user?.id;
+    const [notifications, setNotifications] = useState(backendConfig.enabled ? [] : initialStudentNotifications);
+    const [campaigns, setCampaigns] = useState(backendConfig.enabled ? [] : initialNotificationCampaigns);
+    const [complaints, setComplaints] = useState(backendConfig.enabled ? [] : initialComplaintCases);
+    const [loadError, setLoadError] = useState('');
+    const noticeRequest = useRef(null);
+    const complaintRequest = useRef(null);
+    const complaintUpdateRequest = useRef(null);
+    useEffect(() => {
+        if (!backendConfig.enabled) {
+            return;
+        }
+        if (!userId) {
+            noticeRequest.current = null;
+            setLoadError('');
+            setNotifications([]);
+            setCampaigns([]);
+            setComplaints([]);
+            return;
+        }
+        let cancelled = false;
+        const load = () => apiRequest("/communications/bootstrap")
+            .then((data) => {
+            if (cancelled) {
+                return;
+            }
+            setNotifications(data.notifications ?? []);
+            setCampaigns(data.campaigns ?? []);
+            setComplaints(data.complaints ?? []);
+            setLoadError('');
+        })
+            .catch((error) => { if (!cancelled) setLoadError(error.message); });
+        void load();
+        const timer = window.setInterval(load, 15000);
+        return () => {
+            cancelled = true;
+            window.clearInterval(timer);
+        };
+    }, [userId]);
+    const value = useMemo(() => ({
+        notifications,
+        campaigns,
+        complaints,
+        unreadCount: notifications.filter((item) => item.unread).length,
+        sendNotification: async (input) => {
+            if (backendConfig.enabled) {
+                const signature = JSON.stringify([userId, ...['type', 'title', 'message', 'audience', 'routeCode', 'deliveryMode', 'scheduledFor'].map((field) => input[field] ?? '')]);
+                if (noticeRequest.current?.signature !== signature) noticeRequest.current = { signature, requestId: crypto.randomUUID() };
+                const campaign = await apiRequest("/admin/notifications", { method: "POST", body: { ...input, requestId: noticeRequest.current.requestId } });
+                noticeRequest.current = null;
+                setCampaigns((items) => [campaign, ...items.filter((item) => item.id !== campaign.id)]);
+                return campaign;
+            }
+
+            await wait(550);
+            const id = `NTF-${new Date().getFullYear()}-${String(campaigns.length + 183).padStart(4, "0")}`;
+            const route = findRoute(input.routeCode);
+            const fallbackRecipientCount = input.audience === "all"
+                ? totalStudentCount
+                : route?.studentCount ?? 0;
+            const recipientCount = Number.isFinite(input.recipientCount)
+                ? input.recipientCount
+                : fallbackRecipientCount;
+            const campaign = {
+                ...input,
+                id,
+                createdAt: formatShortDateTime(),
+                status: input.deliveryMode === "scheduled" ? "scheduled" : "delivered",
+                deliveredCount: input.deliveryMode === "scheduled" ? 0 : recipientCount,
+                recipientCount,
+                createdBy: "Admin Operator",
+            };
+            setCampaigns((items) => [campaign, ...items]);
+            if (campaign.status === "delivered" &&
+                (campaign.audience === "all" || campaign.routeCode === defaultStudentRoute.code)) {
+                setNotifications((items) => [
+                    {
+                        id: campaign.id,
+                        type: campaign.type,
+                        title: campaign.title,
+                        message: campaign.message,
+                        createdAt: relativeTimeLabel(new Date().toISOString()),
+                        unread: true,
+                        routeCode: campaign.routeCode,
+                    },
+                    ...items,
+                ]);
+            }
+            return campaign;
+        },
+        markAllNotificationsRead: async () => {
+            if (backendConfig.enabled) await apiRequest('/student/notifications/read', { method: 'POST' });
+            setNotifications((items) => items.map((item) => ({ ...item, unread: false })));
+        },
+        createComplaint: async (input) => {
+            if (backendConfig.enabled) {
+                const signature = JSON.stringify([userId, input.category, input.subject, input.description, input.relatedService]);
+                if (complaintRequest.current?.signature !== signature) complaintRequest.current = { signature, requestId: crypto.randomUUID() };
+                const complaint = await apiRequest("/student/complaints", { method: "POST", body: { ...input, requestId: complaintRequest.current.requestId } });
+                complaintRequest.current = null;
+                setComplaints((items) => [complaint, ...items.filter((item) => item.id !== complaint.id)]);
+                return complaint;
+            }
+
+            await wait(650);
+            const label = formatShortDateTime();
+            const route = findRouteFromService(input.relatedService);
+            const complaint = {
+                ...input,
+                id: `CMP-${new Date().getFullYear()}-${String(complaints.length + 446).padStart(4, "0")}`,
+                studentId: "stu-2023",
+                studentName: "Aarav Shah",
+                studentEmail: "student@iite.indusuni.ac.in",
+                routeCode: route?.code ?? "Not linked",
+                busNumber: route?.primaryBusNumber ?? "Not linked",
+                tripId: route ? `TRIP-CURRENT-${route.code}` : "Not linked",
+                status: "new",
+                assignedTo: "Unassigned",
+                createdAt: label,
+                updatedAt: label,
+                timeline: [
+                    {
+                        id: `evt-${Date.now()}`,
+                        title: "Complaint submitted",
+                        detail: "Submitted through the student application.",
+                        timestamp: label,
+                    },
+                ],
+                internalNotes: [],
+            };
+            setComplaints((items) => [complaint, ...items]);
+            return complaint;
+        },
+        updateComplaint: async (input) => {
+            if (backendConfig.enabled) {
+                const signature = JSON.stringify([userId, input.id, input.status, input.assignedTo, input.resolution, input.internalNote]);
+                if (complaintUpdateRequest.current?.signature !== signature) complaintUpdateRequest.current = { signature, requestId: crypto.randomUUID() };
+                const updated = await apiRequest(`/admin/complaints/${input.id}`, { method: "PATCH", body: { ...input, requestId: complaintUpdateRequest.current.requestId } });
+                complaintUpdateRequest.current = null;
+                setComplaints((items) => items.map((item) => item.id === updated.id ? updated : item));
+                return updated;
+            }
+
+            await wait(450);
+            const label = formatShortDateTime();
+            const current = complaints.find((item) => item.id === input.id);
+            if (!current)
+                throw new Error("Complaint not found.");
+            const statusChanged = current.status !== input.status;
+            const assignmentChanged = current.assignedTo !== input.assignedTo;
+            const updated = {
+                ...current,
+                status: input.status,
+                assignedTo: input.assignedTo,
+                resolution: input.resolution?.trim() || current.resolution,
+                updatedAt: label,
+                internalNotes: input.internalNote?.trim()
+                    ? [
+                        ...current.internalNotes,
+                        {
+                            id: `note-${Date.now()}`,
+                            author: "Admin Operator",
+                            message: input.internalNote.trim(),
+                            createdAt: label,
+                        },
+                    ]
+                    : current.internalNotes,
+                timeline: [
+                    ...current.timeline,
+                    ...(assignmentChanged
+                        ? [
+                            {
+                                id: `evt-assign-${Date.now()}`,
+                                title: "Assignment updated",
+                                detail: `Assigned to ${input.assignedTo}.`,
+                                timestamp: label,
+                            },
+                        ]
+                        : []),
+                    ...(statusChanged
+                        ? [
+                            {
+                                id: `evt-status-${Date.now()}`,
+                                title: input.status === "resolved"
+                                    ? "Resolved"
+                                    : "Status updated",
+                                detail: `Complaint moved to ${input.status.replace("-", " ")}.`,
+                                timestamp: label,
+                            },
+                        ]
+                        : []),
+                ],
+            };
+            setComplaints((items) => items.map((item) => (item.id === input.id ? updated : item)));
+            return updated;
+        },
+    }), [campaigns, complaints, notifications, userId]);
+    return (<CommunicationsContext.Provider value={value}>
+      {userId && loadError && <div className="connection-warning" role="alert">Notifications and complaints could not be refreshed. Last known information is shown. {loadError}</div>}
+      {children}
+    </CommunicationsContext.Provider>);
+}
+export function useCommunications() {
+    const value = useContext(CommunicationsContext);
+    if (!value)
+        throw new Error("useCommunications must be used inside CommunicationsProvider");
+    return value;
+}

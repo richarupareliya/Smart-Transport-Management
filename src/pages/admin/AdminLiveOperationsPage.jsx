@@ -1,0 +1,235 @@
+import { AlertTriangle, BusFront, Clock3, Gauge, MapPin, Radio, Route, Search, Users, } from "lucide-react";
+import { useMemo, useState } from "react";
+import { CircleMarker, MapContainer, Marker, Polyline, Popup, } from "react-leaflet";
+import L from "leaflet";
+import { useAdminData } from "../../admin/AdminDataContext";
+import { AdminModal, AdminPageHeading, AdminStatusBadge, } from "../../components/admin/AdminUI";
+import { CampusMapMarker, MapFitBounds, SmartTileLayer, StopNameTooltip } from "../../components/maps/SmartTransitMap";
+import { indusRoutes, routeForTripDirection } from "../../services/indusRoutes";
+import { formatEventTime } from "../../utils/dateLabels";
+const liveIcon = (status, selected) => L.divIcon({
+    className: `admin-live-marker admin-live-marker--${status} ${selected ? "admin-live-marker--selected" : ""}`,
+    html: "<span>BUS</span>",
+    iconSize: selected ? [46, 46] : [38, 38],
+    iconAnchor: selected ? [23, 23] : [19, 19],
+});
+const isCampusStop = (stop) => /indus university/i.test(String(stop?.name ?? ""));
+export function AdminLiveOperationsPage() {
+    const { fleet, routes } = useAdminData();
+    const [selectedId, setSelectedId] = useState("");
+    const [query, setQuery] = useState("");
+    const [status, setStatus] = useState("all");
+    const [showEmergency, setShowEmergency] = useState(false);
+    const visible = useMemo(() => fleet.filter((bus) => (status === "all" || bus.status === status) &&
+        `${bus.number} ${bus.driver} ${bus.route}`
+            .toLowerCase()
+            .includes(query.toLowerCase())), [fleet, query, status]);
+    const selected = fleet.find((bus) => bus.id === selectedId) ??
+        visible[0] ??
+        fleet[0];
+    const assignedRoute = routes.find((item) => item.code === selected?.route);
+    const route = assignedRoute ? routeForTripDirection(assignedRoute, selected?.direction) : { code: "", stops: [] };
+    const mapRoute = indusRoutes.find((item) => item.code === route.code) ?? indusRoutes[0];
+    const emergencyBus = fleet.find((bus) => bus.tripActive && bus.status === "stale-gps");
+    const emergencyLocation = emergencyBus?.lastLocationAt && emergencyBus.coordinates ? emergencyBus.coordinates.join(", ") : "Location unavailable";
+    const emergencyAge = formatEventTime(emergencyBus?.lastLocationAt);
+    if (!selected) {
+        return (<div>
+      <AdminPageHeading eyebrow="Real-time monitoring" title="Live operations" description="Monitor active buses, service health and emergencies from one view." actions={<span className="admin-last-updated">
+            <Radio /> Waiting for fleet data
+          </span>}/>
+      <div className="admin-empty">
+        <BusFront />
+        <strong>No fleet data available</strong>
+        <p>Add a bus and assign its route and staff to begin monitoring trips.</p>
+      </div>
+    </div>);
+    }
+    return (<div>
+      <AdminPageHeading eyebrow="Real-time monitoring" title="Live operations" description="Monitor active buses, service health and emergencies from one view." actions={<span className="admin-last-updated">
+            <Radio /> {fleet.some((bus) => bus.tripActive && bus.gpsStatus === "live") ? "Recent GPS available" : fleet.some((bus) => bus.tripActive) ? "Waiting for driver GPS" : "Waiting for active trips"}
+          </span>}/>
+      {emergencyBus && <div className="admin-emergency-banner">
+        <AlertTriangle />
+        <div>
+          <strong>GPS attention required</strong>
+          <span>
+            Bus {emergencyBus.number} · Route {emergencyBus.route} · {emergencyLocation} · Last update {emergencyAge}
+          </span>
+        </div>
+        <button onClick={() => setShowEmergency(true)}>View status</button>
+      </div>}
+      <div className="live-operations-layout">
+        <aside className="live-fleet-list">
+          <div className="live-list-filters">
+            <label>
+              <Search />
+              <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search fleet…" aria-label="Search live fleet"/>
+            </label>
+            <select value={status} onChange={(e) => setStatus(e.target.value)} aria-label="Filter live fleet status">
+              <option value="all">All statuses</option>
+              <option value="on-trip">On trip</option>
+              <option value="delayed">Delayed</option>
+              <option value="stopped">Stopped</option>
+              <option value="stale-gps">Stale GPS</option>
+            </select>
+          </div>
+          <div className="live-fleet-scroll">
+            {visible.map((bus) => (<button key={bus.id} className={selected.id === bus.id ? "active" : ""} onClick={() => setSelectedId(bus.id)}>
+                <span className="live-bus-icon">
+                  <BusFront />
+                </span>
+                <span>
+                  <strong>{bus.number}</strong>
+                  <small>
+                    {bus.route} · {bus.driver}
+                  </small>
+                  <em>
+                    {bus.tripActive
+                ? `${bus.speed} km/h · GPS ${bus.gpsUpdated}`
+                : "Driver location not shared"}
+                  </em>
+                </span>
+                <AdminStatusBadge status={bus.status}/>
+              </button>))}
+          </div>
+          {!visible.length && (<div className="admin-empty">
+              <Search />
+              <strong>No fleet matches</strong>
+              <p>Adjust search or status filters.</p>
+            </div>)}
+        </aside>
+        <section className="live-map-workspace">
+          <MapContainer center={mapRoute.mapCenter} zoom={11} scrollWheelZoom={false} className="admin-live-map">
+            <MapFitBounds points={[...route.stops.map((stop) => stop.coordinates), ...(selected.tripActive ? [selected.coordinates] : [])]} trigger={`${selected.id}-${route.code}-${route.stops.length}-${selected.lastLocationAt ?? selected.gpsUpdatedAt ?? ""}`}/>
+            <SmartTileLayer />
+            <Polyline positions={route.stops.map((stop) => stop.coordinates)} pathOptions={{ color: "#0b948f", weight: 5 }}/>
+            {route.stops.map((stop, index) => isCampusStop(stop) ? (<CampusMapMarker key={stop.id} position={stop.coordinates}/>) : (<CircleMarker key={stop.id} center={stop.coordinates} radius={6} pathOptions={{
+                color: "#0b948f",
+                fillColor: index === 0 ? "#ffb547" : "#fff",
+                fillOpacity: 1,
+                weight: 3,
+            }}>
+                  <StopNameTooltip active={index === 0 || stop.id === selected.nextStopId} permanent={index === 0 || stop.id === selected.nextStopId}>
+                    {stop.name}
+                  </StopNameTooltip>
+                  <Popup>
+                    {index + 1}. {stop.name}
+                  </Popup>
+                </CircleMarker>))}
+            {fleet
+            .filter((bus) => bus.tripActive && bus.lastLocationAt && bus.coordinates)
+            .map((bus) => (<Marker key={bus.id} position={bus.coordinates} icon={liveIcon(bus.status, bus.id === selected.id)} eventHandlers={{ click: () => setSelectedId(bus.id) }}>
+                  <StopNameTooltip active={bus.id === selected.id} permanent={bus.id === selected.id}>
+                    {bus.number}
+                  </StopNameTooltip>
+                  <Popup>
+                    {bus.number} · {bus.route}
+                  </Popup>
+                </Marker>))}
+          </MapContainer>
+          <div className="live-map-updated">
+            <i /> Last GPS fix: {formatEventTime(selected.lastLocationAt)}
+          </div>
+        </section>
+        <aside className="live-bus-detail">
+          <div className="live-bus-detail__head">
+            <span className="admin-kpi-icon">
+              <BusFront />
+            </span>
+            <div>
+              <small>Selected bus</small>
+              <h2>{selected.number}</h2>
+              <p>{selected.route} · {selected.driver}</p>
+            </div>
+            <AdminStatusBadge status={selected.status}/>
+          </div>
+          <div className="live-detail-grid">
+            <div>
+              <Gauge />
+              <span>
+                <small>Speed</small>
+                <strong>
+                  {selected.tripActive ? `${selected.speed} km/h` : "—"}
+                </strong>
+              </span>
+            </div>
+            <div>
+              <Clock3 />
+              <span>
+                <small>ETA</small>
+                <strong>{selected.tripActive ? selected.eta : "—"}</strong>
+              </span>
+            </div>
+            <div>
+              <Users />
+              <span>
+                <small>Occupancy</small>
+                <strong>
+                  {selected.occupancy} / {selected.capacity}
+                </strong>
+              </span>
+            </div>
+            <div>
+              <Radio />
+              <span>
+                <small>GPS update</small>
+                <strong>
+                  {selected.tripActive ? selected.gpsUpdated : "Not sharing"}
+                </strong>
+              </span>
+            </div>
+          </div>
+          {!selected.tripActive && (<p className="live-location-private">
+              <Radio /> Driver location is hidden because no trip is active.
+            </p>)}
+          <div className="live-detail-route">
+            <Route />
+            <span>
+              <small>
+                {selected.tripActive ? "Active route" : "Assigned route"}
+              </small>
+              <strong>{route.name}</strong>
+              {selected.tripActive && <small>Started {formatEventTime(selected.startedAt)} · Approx. arrival {selected.estimatedArrivalAt ? formatEventTime(selected.estimatedArrivalAt) : 'unavailable'}</small>}
+            </span>
+          </div>
+          <div className="live-detail-route">
+            <MapPin />
+            <span>
+              <small>Next stop</small>
+              <strong>
+                {selected.tripActive
+            ? (selected.nextStopName ?? route.stops.find((stop) => stop.id === selected.nextStopId)?.name ?? route.destination)
+            : "Trip not started"}
+              </strong>
+            </span>
+          </div>
+        </aside>
+      </div>
+      {showEmergency && emergencyBus && (<AdminModal title="GPS attention required" description={`Bus ${emergencyBus.number} · Last update ${emergencyAge}`} close={() => setShowEmergency(false)} footer={<button className="button admin-primary-button" onClick={() => setShowEmergency(false)}>
+              Acknowledge status
+            </button>}>
+          <dl className="admin-detail-list">
+            <div>
+              <dt>Bus and route</dt>
+              <dd>{emergencyBus.number} · {emergencyBus.route}</dd>
+            </div>
+            <div>
+              <dt>Submitted by</dt>
+              <dd>{emergencyBus.driver}</dd>
+            </div>
+            <div>
+              <dt>Last known location</dt>
+              <dd>{emergencyLocation}, Ahmedabad</dd>
+            </div>
+            <div>
+              <dt>Details</dt>
+              <dd>
+                Driver phone GPS has not sent a fresh update. The last known
+                location remains visible until the next sync.
+              </dd>
+            </div>
+          </dl>
+        </AdminModal>)}
+    </div>);
+}

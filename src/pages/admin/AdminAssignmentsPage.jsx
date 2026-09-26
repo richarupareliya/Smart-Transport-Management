@@ -1,0 +1,136 @@
+import { BusFront, CheckCircle2, ClipboardList, Save, UserRound, Users, } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { mergeAssignmentDrafts } from '../../admin/assignmentDrafts';
+import { useAdminData } from "../../admin/AdminDataContext";
+import { AdminFeedback, AdminPageHeading, AdminStatusBadge, } from "../../components/admin/AdminUI";
+
+function draftFromRoute(route) {
+    return {
+        busId: route.busId ?? "",
+        driverId: route.driverId ?? "",
+        conductorId: route.conductorId ?? "",
+        ...(route._version ? { _version: route._version } : {}),
+    };
+}
+
+export function AdminAssignmentsPage() {
+    const { records, routes, upsertRoute } = useAdminData();
+    const [drafts, setDrafts] = useState(Object.fromEntries(routes.map((route) => [
+        route.id,
+        draftFromRoute(route),
+    ])));
+    const [feedback, setFeedback] = useState(null);
+    const [savingId, setSavingId] = useState("");
+    const dirtyIds = useRef(new Set());
+    useEffect(() => {
+        setDrafts((current) => mergeAssignmentDrafts(routes, current, dirtyIds.current));
+    }, [routes]);
+    const changeDraft = (routeId, patch) => {
+        dirtyIds.current.add(routeId);
+        setDrafts((current) => ({ ...current, [routeId]: { ...current[routeId], ...patch } }));
+    };
+    const save = async (routeId) => {
+        if (savingId) return;
+        const route = routes.find((item) => item.id === routeId);
+        const draft = drafts[routeId];
+        if (!route || !draft?.busId || !draft?.driverId || !draft?.conductorId) {
+            setFeedback({
+                type: "error",
+                title: "Assignment incomplete",
+                message: `Select a bus, driver and conductor before saving ${route?.code ?? "this route"}.`,
+            });
+            return;
+        }
+        setSavingId(routeId);
+        try {
+            const saved = await upsertRoute({ ...route, ...draft });
+            dirtyIds.current.delete(routeId);
+            setDrafts((current) => ({
+                ...current,
+                [saved.id]: draftFromRoute(saved),
+            }));
+            setFeedback({
+                type: "success",
+                title: "Assignments saved",
+                message: `${saved.code} is now synced across admin, driver, conductor and student dashboards.`,
+            });
+        }
+        catch (error) {
+            setFeedback({
+                type: "error",
+                title: "Could not save",
+                message: error instanceof Error ? error.message : "The assignment could not be saved. Check your connection and retry.",
+            });
+        }
+        finally {
+            setSavingId("");
+        }
+    };
+    return (<div>
+      <AdminPageHeading eyebrow="Operations setup" title="Assignment management" description="Assign a bus, driver and conductor to every active route."/>
+      {feedback && (<AdminFeedback {...feedback} dismiss={() => setFeedback(null)}/>)}
+      <section className="assignment-grid">
+        {routes.map((route) => {
+            const draft = drafts[route.id] ?? draftFromRoute(route);
+            return (<article key={route.id}>
+              <header>
+                <span className="admin-kpi-icon">
+                  <ClipboardList />
+                </span>
+                <div>
+                  <small>{route.code}</small>
+                  <h2>{route.name}</h2>
+                </div>
+                <AdminStatusBadge status={route.status}/>
+              </header>
+              <label>
+                <span>
+                  <BusFront /> Assigned bus
+                </span>
+                <select value={draft.busId} onChange={(e) => changeDraft(route.id, { busId: e.target.value })}>
+                  <option value="">Select bus</option>
+                  {records.buses
+                    .filter((item) => item.status === "active" || item.id === draft.busId)
+                    .map((item) => (<option value={item.id} key={item.id}>
+                        {item.name} · {item.code}
+                      </option>))}
+                </select>
+              </label>
+              <label>
+                <span>
+                  <UserRound /> Assigned driver
+                </span>
+                <select value={draft.driverId} onChange={(e) => changeDraft(route.id, { driverId: e.target.value })}>
+                  <option value="">Select driver</option>
+                  {records.drivers
+                    .filter((item) => item.status === "active" || item.id === draft.driverId)
+                    .map((item) => (<option value={item.id} key={item.id}>
+                        {item.name} · {item.code}
+                      </option>))}
+                </select>
+              </label>
+              <label>
+                <span>
+                  <Users /> Assigned conductor
+                </span>
+                <select value={draft.conductorId} onChange={(e) => changeDraft(route.id, { conductorId: e.target.value })}>
+                  <option value="">Select conductor</option>
+                  {records.conductors
+                    .filter((item) => item.status === "active" ||
+                    item.id === draft.conductorId)
+                    .map((item) => (<option value={item.id} key={item.id}>
+                        {item.name} · {item.code}
+                      </option>))}
+                </select>
+              </label>
+              <button className="button admin-primary-button" onClick={() => void save(route.id)} disabled={Boolean(savingId)}>
+                <Save /> {savingId === route.id ? "Saving..." : "Save assignments"}
+              </button>
+              {draft.busId && draft.driverId && draft.conductorId && (<p className="assignment-complete">
+                  <CheckCircle2 /> Assignment complete
+                </p>)}
+            </article>);
+        })}
+      </section>
+    </div>);
+}

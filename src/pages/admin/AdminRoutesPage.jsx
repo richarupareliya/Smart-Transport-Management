@@ -1,0 +1,593 @@
+import { ArrowDown, ArrowLeft, ArrowUp, BusFront, MapPin, Pencil, Plus, Route, Save, Search, ToggleLeft, ToggleRight, Trash2, UserRound, Users, X, } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { CircleMarker, MapContainer, Polyline, Popup, } from "react-leaflet";
+import { useMapEvents } from "react-leaflet";
+import { useAdminData } from "../../admin/AdminDataContext";
+import { cleanRouteForSave, initialCoordinateTarget, prepareRouteForEdit, updateStopCoordinates } from '../../admin/routeDrafts';
+import { AdminFeedback, AdminModal, AdminPageHeading, AdminStatusBadge, } from "../../components/admin/AdminUI";
+import { CampusMapMarker, MapAutoCenter, MapFitBounds, SmartTileLayer, StopNameTooltip } from "../../components/maps/SmartTransitMap";
+import { coordinatesFromStop, coordinatesFromText, currentBrowserLocation, defaultAhmedabadMapCenter, formatCoordinate, onlineLocationResults, routeLocationResults, uniqueLocationResults, } from "../../services/locationSearch";
+const emptyRoute = () => ({
+    id: "",
+    code: "",
+    name: "",
+    startPoint: "",
+    destination: "",
+    status: "active",
+    busId: "",
+    driverId: "",
+    conductorId: "",
+    stops: [],
+});
+const isCampusStop = (stop) => /indus university/i.test(String(stop?.name ?? ""));
+export function AdminRoutesPage() {
+    const { routes, records, fleet, upsertRoute, toggleRoute, deleteRecord } = useAdminData();
+    const [searchParams] = useSearchParams();
+    const requestedRoute = routes.find((route) => route.code === searchParams.get('editRoute'));
+    const [selectedId, setSelectedId] = useState(requestedRoute?.id ?? routes[0]?.id ?? "");
+    const [query, setQuery] = useState("");
+    const [editing, setEditing] = useState(() => requestedRoute ? prepareRouteForEdit(requestedRoute) : null);
+    const [errors, setErrors] = useState({});
+    const [feedback, setFeedback] = useState(null);
+    const [saving, setSaving] = useState(false);
+    const [changingStatus, setChangingStatus] = useState(false);
+    const [deleting, setDeleting] = useState(null);
+    const [deleteError, setDeleteError] = useState('');
+    const filtered = useMemo(() => routes.filter((route) => `${route.code} ${route.name} ${route.startPoint} ${route.destination}`
+        .toLowerCase()
+        .includes(query.toLowerCase())), [routes, query]);
+    const selected = routes.find((route) => route.id === selectedId) ?? filtered[0] ?? routes[0];
+    const beginEdit = (route) => {
+        setEditing(prepareRouteForEdit(route));
+        setErrors({});
+        setFeedback(null);
+    };
+    const save = async (event) => {
+        event.preventDefault();
+        if (!editing || saving)
+            return;
+        setFeedback(null);
+        const next = {};
+        if (!editing.code.trim())
+            next.code = "Route code is required.";
+        if (!editing.name.trim())
+            next.name = "Route name is required.";
+        if (!editing.startPoint.trim())
+            next.startPoint = "Start point is required.";
+        if (!editing.destination.trim())
+            next.destination = "Destination is required.";
+        if (routes.some((route) => route.code.toLowerCase() === editing.code.trim().toLowerCase() &&
+            route.id !== editing.id))
+            next.code = "Route code already exists.";
+        if (editing.stops.length < 2)
+            next.stops = "Add at least two ordered stops.";
+        if (editing.stops.some((stop) => !stop.name.trim() || !stop.scheduledTime.trim()))
+            next.stops = "Every stop needs a name and scheduled time.";
+        if (editing.stops.some((stop) => !coordinatesFromStop(stop)))
+            next.stops = "Every stop needs valid latitude and longitude.";
+        setErrors(next);
+        if (Object.keys(next).length) {
+            setFeedback({ type: 'error', title: 'Route not saved', message: Object.values(next).join(' ') });
+            return;
+        }
+        const route = cleanRouteForSave({ ...editing, id: editing.id || `route-${Date.now()}` });
+        setSaving(true);
+        try {
+            const saved = await upsertRoute(route);
+            setSelectedId(saved.id);
+            setEditing(null);
+            setFeedback({
+                type: "success",
+                title: "Route saved",
+                message: `${saved.code} was saved. Other dashboards will receive the changes on their next refresh.`,
+            });
+        }
+        catch (error) {
+            setFeedback({
+                type: "error",
+                title: "Could not save route",
+                message: error instanceof Error ? error.message : "The route could not be saved. Check your connection and retry.",
+            });
+        }
+        finally {
+            setSaving(false);
+        }
+    };
+    return (<div>
+      {editing ? (<RouteEditor route={editing} setRoute={setEditing} errors={errors} records={records} routes={routes} save={save} saving={saving} feedback={feedback} dismissFeedback={() => setFeedback(null)} tripActive={fleet.some((bus) => bus.route === editing.code && bus.tripActive)} cancel={() => setEditing(null)}/>) : (<>
+          <AdminPageHeading eyebrow="Network planning" title="Routes & stops builder" description="Create routes, order stops, schedule arrivals and assign operating teams." actions={<button className="button admin-primary-button" onClick={() => beginEdit(emptyRoute())}>
+                <Plus /> Add route
+              </button>}/>
+          {feedback && (<AdminFeedback {...feedback} dismiss={() => setFeedback(null)}/>)}
+          <div className="route-builder-layout">
+            <aside className="admin-route-list">
+              <label className="admin-search">
+                <Search />
+                <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search routes…" aria-label="Search routes"/>
+              </label>
+              <div>
+                {filtered.map((route) => (<button key={route.id} className={selected?.id === route.id ? "active" : ""} onClick={() => setSelectedId(route.id)}>
+                    <span className="admin-kpi-icon admin-kpi-icon--small">
+                      <Route />
+                    </span>
+                    <span>
+                      <small>{route.code}</small>
+                      <strong>{route.name}</strong>
+                      <em>
+                        {route.stops.length} stops · {route.startPoint} to{" "}
+                        {route.destination}
+                      </em>
+                    </span>
+                    <AdminStatusBadge status={route.status}/>
+                  </button>))}
+              </div>
+            </aside>
+            {selected && (<section className="route-detail-workspace">
+                <header>
+                  <div>
+                    <span>{selected.code}</span>
+                    <h2>{selected.name}</h2>
+                    <p>
+                      <MapPin /> {selected.startPoint} to {selected.destination}
+                    </p>
+                  </div>
+                  <div>
+                    <button className="button button--secondary" disabled={changingStatus} onClick={async () => {
+                        setChangingStatus(true);
+                        try { await toggleRoute(selected.id); setFeedback({ type: 'success', title: 'Route status updated', message: selected.code }); }
+                        catch (error) { setFeedback({ type: 'error', title: 'Status not changed', message: error.message }); }
+                        finally { setChangingStatus(false); }
+                    }}>
+                      {selected.status === "active" ? (<ToggleRight />) : (<ToggleLeft />)}
+                      {selected.status === "active" ? "Deactivate" : "Activate"}
+                    </button>
+                    <button className="button admin-primary-button" onClick={() => beginEdit(selected)}>
+                      <Pencil /> Edit route
+                    </button>
+                    <button className="button button--secondary" title="Delete route" aria-label={`Delete ${selected.code}`} onClick={() => { setDeleteError(''); setDeleting(selected); }}><Trash2 /></button>
+                  </div>
+                </header>
+                <div className="route-detail-grid">
+                  <section className="route-stop-view">
+                    <div className="admin-panel-title">
+                      <div>
+                        <h3>Ordered stop timeline</h3>
+                        <p>Scheduled morning arrivals</p>
+                      </div>
+                      <span>{selected.stops.length} stops</span>
+                    </div>
+                    {selected.stops.map((stop, index) => (<div className="admin-route-stop" key={stop.id}>
+                        <span>{index + 1}</span>
+                        <div>
+                          <strong>{stop.name}</strong>
+                          <small>
+                            {index === 0
+                        ? "Start point"
+                        : index === selected.stops.length - 1
+                            ? "Destination"
+                            : `Stop ${index + 1}`}
+                          </small>
+                        </div>
+                        <time>{stop.scheduledTime}</time>
+                      </div>))}
+                  </section>
+                  <section className="route-preview-map">
+                    <MapContainer key={selected.id} center={selected.stops[0]?.coordinates ?? [23.07, 72.54]} zoom={11} scrollWheelZoom={false} className="admin-route-map">
+                      <MapFitBounds points={selected.stops.map((stop) => stop.coordinates)} trigger={`${selected.id}-${selected.stops.length}`}/>
+                      <SmartTileLayer />
+                      <Polyline positions={selected.stops.map((stop) => stop.coordinates)} pathOptions={{ color: "#0b948f", weight: 5 }}/>
+                      {selected.stops.map((stop, index) => isCampusStop(stop) ? (<CampusMapMarker key={stop.id} position={stop.coordinates}/>) : (<CircleMarker key={stop.id} center={stop.coordinates} radius={8} pathOptions={{
+                        color: "#0b948f",
+                        fillColor: index === 0 ? "#ffb547" : "#fff",
+                        fillOpacity: 1,
+                        weight: 3,
+                    }}>
+                          <StopNameTooltip active={index === 0} permanent={index === 0 || index === selected.stops.length - 2 || index % 5 === 0}>
+                            {stop.name}
+                          </StopNameTooltip>
+                          <Popup>
+                            {index + 1}. {stop.name} · {stop.scheduledTime}
+                          </Popup>
+                        </CircleMarker>))}
+                    </MapContainer>
+                  </section>
+                </div>
+                <div className="route-assignments-view">
+                  <AssignmentItem icon={<BusFront />} label="Bus" value={records.buses.find((item) => item.id === selected.busId)
+                    ?.name ?? "Unassigned"}/>
+                  <AssignmentItem icon={<UserRound />} label="Driver" value={records.drivers.find((item) => item.id === selected.driverId)?.name ?? "Unassigned"}/>
+                  <AssignmentItem icon={<Users />} label="Conductor" value={records.conductors.find((item) => item.id === selected.conductorId)?.name ?? "Unassigned"}/>
+                </div>
+              </section>)}
+          </div>
+        </>)}
+      {deleting && <AdminModal title={`Delete ${deleting.code}?`} description="Unassign its staff, bus and students first. Routes with trip history must be deactivated instead." close={() => { if (!saving) setDeleting(null); }} footer={<>
+        <button className="button button--secondary" disabled={saving} onClick={() => setDeleting(null)}>Cancel</button>
+        <button className="button button--danger" disabled={saving} onClick={async () => {
+            setSaving(true);
+            setDeleteError('');
+            try { await deleteRecord('routes', deleting.id); setDeleting(null); setFeedback({ type: 'success', title: 'Route deleted', message: deleting.code }); }
+            catch (error) { setDeleteError(error.message); }
+            finally { setSaving(false); }
+        }}><Trash2 /> {saving ? 'Deleting...' : 'Delete route'}</button>
+      </>}><p>Deleted routes cannot be restored through this screen.</p>{deleteError && <AdminFeedback type="error" title="Not deleted" message={deleteError} dismiss={() => setDeleteError('')} />}</AdminModal>}
+    </div>);
+}
+export function RouteEditor({ route, setRoute, errors, records, routes, save, saving, cancel, feedback, dismissFeedback, tripActive }) {
+    const [newStop, setNewStop] = useState({
+        name: "",
+        scheduledTime: "",
+        lat: "",
+        lng: "",
+    });
+    const [coordinateTarget, setCoordinateTarget] = useState(() => initialCoordinateTarget(route));
+    const [stopError, setStopError] = useState("");
+    const [locationQuery, setLocationQuery] = useState("");
+    const [locationResults, setLocationResults] = useState([]);
+    const [locationMessage, setLocationMessage] = useState("");
+    const [searchingOnline, setSearchingOnline] = useState(false);
+    const [searchingLocation, setSearchingLocation] = useState(false);
+    const [mapFocus, setMapFocus] = useState(null);
+    const validStops = route.stops
+        .map((stop, index) => ({ stop, index, coordinates: coordinatesFromStop(stop) }))
+        .filter((item) => item.coordinates);
+    const draftCoordinates = coordinatesFromStop(newStop);
+    const mapCenter = validStops[0]?.coordinates ?? draftCoordinates ?? defaultAhmedabadMapCenter;
+    const targetStop = route.stops.find((stop) => stop.id === coordinateTarget);
+    const coordinateTargetLabel = coordinateTarget === "new" ? "the new stop" : targetStop?.name || "the selected stop";
+    const targetStopName = coordinateTarget === "new" ? newStop.name : targetStop?.name ?? "";
+    const targetCoordinates = coordinateTarget === "new" ? draftCoordinates : targetStop ? coordinatesFromStop(targetStop) : null;
+    const searchText = locationQuery.trim() || targetStopName.trim();
+    useEffect(() => {
+        setLocationResults([]);
+        setLocationMessage("");
+        setLocationQuery(targetStopName);
+    }, [coordinateTarget, targetStopName]);
+    const updateStop = (index, patch) => setRoute((current) => ({
+        ...current,
+        stops: current.stops.map((stop, i) => i === index ? { ...stop, ...patch } : stop),
+    }));
+    const selectCoordinateTarget = (id) => {
+        setCoordinateTarget(id);
+        const stop = id === 'new' ? newStop : route.stops.find((item) => item.id === id);
+        setMapFocus(coordinatesFromStop(stop));
+    };
+    const applyCoordinatesToTarget = ({ lat, lng }, name = "") => {
+        const coordinatePatch = {
+            lat: formatCoordinate(lat),
+            lng: formatCoordinate(lng),
+        };
+        setMapFocus([Number(lat), Number(lng)]);
+        if (coordinateTarget === "new") {
+            setNewStop((current) => ({
+                ...current,
+                ...(!current.name.trim() && name ? { name } : {}),
+                ...coordinatePatch,
+            }));
+            return;
+        }
+        setRoute((current) => updateStopCoordinates(current, coordinateTarget, { lat, lng }));
+    };
+    const applyMapCoordinate = ({ lat, lng }) => applyCoordinatesToTarget({ lat, lng });
+    const searchLocation = async () => {
+        const query = searchText;
+        if (!query) {
+            setLocationMessage("Enter a stop, area, landmark, map link, or lat,lng.");
+            return;
+        }
+        const pastedCoordinates = coordinatesFromText(query);
+        if (pastedCoordinates) {
+            applyCoordinatesToTarget({ lat: pastedCoordinates[0], lng: pastedCoordinates[1] });
+            setLocationResults([]);
+            setLocationMessage("Coordinates filled from the pasted map link or lat,lng text.");
+            return;
+        }
+        const savedMatches = routeLocationResults(query, routes);
+        setSearchingOnline(true);
+        setLocationMessage(savedMatches.length ? "Checking saved stops and online map..." : "Searching the online map...");
+        try {
+            const onlineMatches = await onlineLocationResults(query);
+            const matches = uniqueLocationResults([...savedMatches, ...onlineMatches]).slice(0, 10);
+            setLocationResults(matches);
+            if (matches.length) {
+                setLocationMessage(onlineMatches.length
+                    ? "Choose a saved or online result, then fine-tune by clicking the exact pickup point on the map."
+                    : "Choose the matching saved stop, then fine-tune by clicking the exact pickup point on the map.");
+            }
+            else {
+                setLocationMessage("No map match found. Paste a Google Maps link, paste lat,lng, use current location, or click the map.");
+            }
+        }
+        catch (error) {
+            setLocationResults(savedMatches);
+            setLocationMessage(savedMatches.length
+                ? "Saved stop matches found. Online map search is unavailable right now."
+                : error instanceof Error
+                    ? error.message
+                    : "Online map search is unavailable right now. Paste a map link, lat,lng, or click the map.");
+        }
+        finally {
+            setSearchingOnline(false);
+        }
+    };
+    const applyCurrentBrowserLocation = async () => {
+        setSearchingLocation(true);
+        try {
+            const current = await currentBrowserLocation();
+            applyCoordinatesToTarget({ lat: current.lat, lng: current.lng });
+            setLocationResults([]);
+            setLocationMessage(`Current location selected${Number.isFinite(current.accuracy) ? `, about ${Math.round(current.accuracy)} m accuracy` : ""}.`);
+        }
+        catch (error) {
+            setLocationMessage(error instanceof Error ? error.message : "Current location is unavailable.");
+        }
+        finally {
+            setSearchingLocation(false);
+        }
+    };
+    const chooseLocation = (result) => {
+        applyCoordinatesToTarget({ lat: result.lat, lng: result.lng }, result.name);
+        setLocationMessage(`${result.name} selected.`);
+    };
+    const move = (index, direction) => {
+        const target = index + direction;
+        if (target < 0 || target >= route.stops.length)
+            return;
+        const stops = [...route.stops];
+        [stops[index], stops[target]] = [stops[target], stops[index]];
+        setRoute({ ...route, stops });
+    };
+    const addStop = () => {
+        const coordinates = coordinatesFromStop(newStop);
+        if (!newStop.name.trim() ||
+            !newStop.scheduledTime ||
+            !coordinates) {
+            setStopError("Enter a stop name, time and valid coordinates.");
+            return;
+        }
+        setRoute({
+            ...route,
+            stops: [
+                ...route.stops,
+                {
+                    id: `rs-${Date.now()}`,
+                    name: newStop.name,
+                    scheduledTime: newStop.scheduledTime,
+                    coordinates,
+                    lat: newStop.lat,
+                    lng: newStop.lng,
+                },
+            ],
+        });
+        setNewStop({ name: "", scheduledTime: "", lat: "", lng: "" });
+        setCoordinateTarget("new");
+        setStopError("");
+    };
+    return (<form onSubmit={save} noValidate>
+      <AdminPageHeading eyebrow={route.id ? "Edit route" : "New route"} title={route.id ? `${route.code} · ${route.name}` : "Create a route"} description="Configure route details, ordered stops, schedule and assignments." actions={<button type="button" className="button button--secondary" onClick={cancel}>
+            <X /> Cancel
+          </button>}/>
+      <div className="route-editor-grid">
+        <section className="admin-panel route-editor-details">
+          <div className="admin-panel-title">
+            <div>
+              <h2>Route details</h2>
+              <p>Required network information</p>
+            </div>
+          </div>
+          <div className="admin-form-row">
+            <RouteField label="Route code" value={route.code} setValue={(value) => setRoute({ ...route, code: value })} error={errors.code}/>
+            <RouteField label="Route name" value={route.name} setValue={(value) => setRoute({ ...route, name: value })} error={errors.name}/>
+          </div>
+          <div className="admin-form-row">
+            <RouteField label="Start point" value={route.startPoint} setValue={(value) => setRoute({ ...route, startPoint: value })} error={errors.startPoint}/>
+            <RouteField label="Destination" value={route.destination} setValue={(value) => setRoute({ ...route, destination: value })} error={errors.destination}/>
+          </div>
+          <label className="admin-form-field">
+            <span>Route status</span>
+            <select value={route.status} onChange={(e) => setRoute({
+            ...route,
+            status: e.target.value,
+        })}>
+              <option value="active">Active</option>
+              <option value="inactive">Inactive</option>
+            </select>
+          </label>
+        </section>
+        <section className="admin-panel route-editor-assign">
+          <div className="admin-panel-title">
+            <div>
+              <h2>Assignments</h2>
+              <p>Bus and operating staff</p>
+            </div>
+          </div>
+          <label className="admin-form-field">
+            <span>Assign bus</span>
+            <select value={route.busId} onChange={(e) => setRoute({ ...route, busId: e.target.value })}>
+              <option value="">Unassigned</option>
+              {records.buses
+            .filter((item) => item.status === "active" || item.id === route.busId)
+            .map((item) => (<option key={item.id} value={item.id}>
+                    {item.name} · {item.code}
+                  </option>))}
+            </select>
+          </label>
+          <label className="admin-form-field">
+            <span>Assign driver</span>
+            <select value={route.driverId} onChange={(e) => setRoute({ ...route, driverId: e.target.value })}>
+              <option value="">Unassigned</option>
+              {records.drivers
+            .filter((item) => item.status === "active" || item.id === route.driverId)
+            .map((item) => (<option key={item.id} value={item.id}>
+                    {item.name}
+                  </option>))}
+            </select>
+          </label>
+          <label className="admin-form-field">
+            <span>Assign conductor</span>
+            <select value={route.conductorId} onChange={(e) => setRoute({ ...route, conductorId: e.target.value })}>
+              <option value="">Unassigned</option>
+              {records.conductors
+            .filter((item) => item.status === "active" || item.id === route.conductorId)
+            .map((item) => (<option key={item.id} value={item.id}>
+                    {item.name}
+                  </option>))}
+            </select>
+          </label>
+        </section>
+        <section className="admin-panel route-editor-stops">
+          <div className="admin-panel-title">
+            <div>
+              <h2>Ordered stops & schedule</h2>
+              <p>Reorder with arrows or edit stop details inline</p>
+            </div>
+            <span>{route.stops.length} stops</span>
+          </div>
+          {errors.stops && (<div className="route-editor-error">{errors.stops}</div>)}
+          <div className="route-editor-stop-list">
+            {route.stops.map((stop, index) => (<div key={stop.id}>
+                <span className="route-stop-order">{index + 1}</span>
+                <input aria-label={`Stop ${index + 1} name`} value={stop.name} onChange={(e) => updateStop(index, { name: e.target.value })}/>
+                <input aria-label={`Stop ${index + 1} time`} value={stop.scheduledTime} onChange={(e) => updateStop(index, { scheduledTime: e.target.value })}/>
+                <input aria-label={`Stop ${index + 1} latitude`} value={stop.lat ?? formatCoordinate(stop.coordinates?.[0])} onChange={(e) => updateStop(index, { lat: e.target.value })} placeholder="Latitude"/>
+                <input aria-label={`Stop ${index + 1} longitude`} value={stop.lng ?? formatCoordinate(stop.coordinates?.[1])} onChange={(e) => updateStop(index, { lng: e.target.value })} placeholder="Longitude"/>
+                <div>
+                  <button type="button" className={coordinateTarget === stop.id ? "route-pick-button route-pick-button--active" : "route-pick-button"} onClick={() => selectCoordinateTarget(stop.id)} aria-pressed={coordinateTarget === stop.id} aria-label={`Pick ${stop.name} coordinates on map`}>
+                    <MapPin />
+                  </button>
+                  <button type="button" disabled={index === 0} onClick={() => move(index, -1)} aria-label={`Move ${stop.name} up`}>
+                    <ArrowUp />
+                  </button>
+                  <button type="button" disabled={index === route.stops.length - 1} onClick={() => move(index, 1)} aria-label={`Move ${stop.name} down`}>
+                    <ArrowDown />
+                  </button>
+                  <button type="button" onClick={() => {
+                      const stops = route.stops.filter((item) => item.id !== stop.id);
+                      setRoute({ ...route, stops });
+                      if (coordinateTarget === stop.id) selectCoordinateTarget(stops[0]?.id ?? 'new');
+                  }} aria-label={`Remove ${stop.name}`}>
+                    <Trash2 />
+                  </button>
+                </div>
+              </div>))}
+          </div>
+          <div className="route-add-stop">
+            <input aria-label="New stop name" value={newStop.name} onChange={(e) => setNewStop({ ...newStop, name: e.target.value })} placeholder="Stop name"/>
+            <input aria-label="New stop time" value={newStop.scheduledTime} onChange={(e) => setNewStop({ ...newStop, scheduledTime: e.target.value })} placeholder="e.g. 7:30 AM"/>
+            <input aria-label="New stop latitude" value={newStop.lat} onChange={(e) => setNewStop({ ...newStop, lat: e.target.value })} placeholder="Latitude"/>
+            <input aria-label="New stop longitude" value={newStop.lng} onChange={(e) => setNewStop({ ...newStop, lng: e.target.value })} placeholder="Longitude"/>
+            <button type="button" className={coordinateTarget === "new" ? "route-pick-button route-pick-button--active" : "route-pick-button"} onClick={() => selectCoordinateTarget("new")}>
+              <MapPin /> Pick
+            </button>
+            <button type="button" className="button button--secondary" onClick={addStop}>
+              <Plus /> Add stop
+            </button>
+          </div>
+          {stopError && <small className="field-error">{stopError}</small>}
+        </section>
+        <section className="admin-panel route-editor-map">
+          <div className="admin-panel-title">
+            <div>
+              <h2>Stop location</h2>
+              <p>Search, select a result, or click the map for {coordinateTargetLabel}</p>
+            </div>
+          </div>
+          <label className="admin-form-field">
+            <span>Stop to update on map</span>
+            <select value={coordinateTarget} onChange={(event) => selectCoordinateTarget(event.target.value)}>
+              {route.stops.map((stop, index) => <option key={stop.id} value={stop.id}>{index + 1}. {stop.name}</option>)}
+              <option value="new">New stop (add it before saving)</option>
+            </select>
+          </label>
+          <div className="route-location-search">
+            <label className="admin-search">
+              <Search />
+              <input value={locationQuery} onChange={(event) => setLocationQuery(event.target.value)} onKeyDown={(event) => {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                void searchLocation();
+            }
+        }} placeholder="Search stop, area, landmark, or paste map link" aria-label="Search stop location"/>
+            </label>
+            <button type="button" className="button button--secondary" onClick={() => void searchLocation()} disabled={searchingOnline}>
+              <Search /> {searchingOnline ? "Searching..." : "Find online"}
+            </button>
+            <button type="button" className="button button--secondary" onClick={() => void applyCurrentBrowserLocation()} disabled={searchingLocation}>
+              <MapPin /> {searchingLocation ? "Locating..." : "Use my location"}
+            </button>
+          </div>
+          {locationMessage && <small className="route-location-message">{locationMessage}</small>}
+          {locationResults.length > 0 && (<div className="route-location-results">
+              {locationResults.map((result) => (<button type="button" key={result.id} onClick={() => chooseLocation(result)}>
+                  <span>
+                    <strong>{result.name}</strong>
+                    <small>{result.description}</small>
+                  </span>
+                  <em>{result.source}</em>
+                </button>))}
+            </div>)}
+          <MapContainer key={route.id || 'new-route'} center={mapCenter} zoom={11} scrollWheelZoom={false} className="admin-route-map">
+              <MapFitBounds points={[...validStops.map((item) => item.coordinates), ...(draftCoordinates ? [draftCoordinates] : [])]} enabled={!mapFocus} trigger={`${route.id || "new"}-${validStops.length}-${Boolean(draftCoordinates)}`}/>
+              <MapAutoCenter position={mapFocus ?? targetCoordinates ?? mapCenter}/>
+              <MapCoordinatePicker onPick={applyMapCoordinate}/>
+              <SmartTileLayer />
+              {validStops.length > 1 && <Polyline positions={validStops.map((item) => item.coordinates)} pathOptions={{ color: "#0b948f", weight: 5 }}/>}
+              {validStops.map(({ stop, index, coordinates }) => isCampusStop(stop) ? (<CampusMapMarker key={stop.id} position={coordinates}/>) : (<CircleMarker key={stop.id} center={coordinates} radius={8} pathOptions={{
+                    color: "#0b948f",
+                    fillColor: coordinateTarget === stop.id ? "#ffb547" : index === 0 ? "#0b948f" : "#fff",
+                    fillOpacity: 1,
+                    weight: 3,
+                }}>
+                  <StopNameTooltip active={coordinateTarget === stop.id || index === 0} permanent={coordinateTarget === stop.id || index === 0 || index === route.stops.length - 2 || index % 5 === 0}>
+                    {stop.name}
+                  </StopNameTooltip>
+                  <Popup>
+                    {index + 1}. {stop.name}
+                  </Popup>
+                </CircleMarker>))}
+              {coordinateTarget === "new" && draftCoordinates && (<CircleMarker center={draftCoordinates} radius={7} pathOptions={{ color: "#ffb547", fillColor: "#ffb547", fillOpacity: 0.85, weight: 3 }}>
+                  <Popup>New stop coordinates</Popup>
+                </CircleMarker>)}
+            </MapContainer>
+          <p className="route-map-picker-hint">
+            Select a stop’s pin button, then click the exact point on the map.
+          </p>
+        </section>
+      </div>
+      {tripActive && <p className="route-editor-error" role="status">This route has an active trip. Ask its driver to end the trip before saving route changes. Keep this editor open to retain your changes.</p>}
+      {feedback && <AdminFeedback {...feedback} dismiss={dismissFeedback} />}
+      <div className="route-editor-actions">
+        <button type="button" className="button button--secondary" onClick={cancel}>
+          <ArrowLeft /> Discard changes
+        </button>
+        <button className="button admin-primary-button" disabled={saving}>
+          <Save /> {saving ? "Saving..." : "Save route"}
+        </button>
+      </div>
+    </form>);
+}
+function MapCoordinatePicker({ onPick }) {
+    useMapEvents({
+        click(event) {
+            onPick(event.latlng);
+        },
+    });
+    return null;
+}
+function RouteField({ label, value, setValue, error, }) {
+    return (<label className="admin-form-field">
+      <span>{label} *</span>
+      <input value={value} onChange={(e) => setValue(e.target.value)} aria-invalid={Boolean(error)}/>
+      {error && <small>{error}</small>}
+    </label>);
+}
+function AssignmentItem({ icon, label, value, }) {
+    return (<div>
+      <span className="admin-kpi-icon admin-kpi-icon--small">{icon}</span>
+      <span>
+        <small>{label}</small>
+        <strong>{value}</strong>
+      </span>
+    </div>);
+}
